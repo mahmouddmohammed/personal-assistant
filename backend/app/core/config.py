@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # --- LLM provider ---
     GEMINI_API_KEY: str = ""
-    LLM_MODEL: str = "gemini-2.0-flash"
+    LLM_MODEL: str = "gemini-3.1-flash-lite"
     EMBEDDING_MODEL: str = "models/text-embedding-004"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
