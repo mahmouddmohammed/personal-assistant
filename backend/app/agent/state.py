@@ -42,20 +42,22 @@ class WorkerResult(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
-class _ResetWorkerResults:
-    """Sentinel: when it's the first element of an incoming `worker_results`
-    update, the reducer drops everything accumulated so far instead of
-    appending. See module docstring."""
+RESET_WORKER_RESULTS = "__RESET_WORKER_RESULTS__"
+"""Sentinel: when it's the first element of an incoming `worker_results`
+update, the reducer drops everything accumulated so far instead of
+appending. See module docstring.
 
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
-        return "<RESET_WORKER_RESULTS>"
-
-
-RESET_WORKER_RESULTS = _ResetWorkerResults()
+Must be a plain, msgpack-serializable value (a str, not a custom class
+instance) because the Postgres checkpointer persists every pending state
+write via `ormsgpack`, which only knows how to encode plain data types —
+an arbitrary Python object crashes serialization (see graph_service traceback:
+`TypeError: Type is not msgpack serializable`). Compared by value (`==`),
+not identity (`is`), since a value round-tripped through the checkpointer
+is a new (but equal) string object, not the same object identity."""
 
 
 def _reduce_worker_results(existing: list[WorkerResult], new: list) -> list[WorkerResult]:
-    if new and new[0] is RESET_WORKER_RESULTS:
+    if new and new[0] == RESET_WORKER_RESULTS:
         return list(new[1:])
     return list(existing) + list(new)
 

@@ -67,6 +67,7 @@ class ExtractInfoState(TypedDict):
     metadata: dict
     user_id: str
     worker_results: Annotated[list[WorkerResult], operator.add]
+    _items: list[RawExtractedItem]                          # set by extract_and_classify, read by dispatch_refine
     item: Optional[dict]                                   # set only on refine_* branches
     refined_items: Annotated[list[dict], operator.add]
 
