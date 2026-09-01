@@ -1,6 +1,7 @@
 """Worker 6 — standard ReAct tool-calling loop. Only book_flight
 (side-effecting) pauses for confirmation — search/check/list are
 read-only and run freely."""
+import logging
 import operator
 from functools import lru_cache
 from typing import Annotated
@@ -10,9 +11,12 @@ from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
+from app.agent.context import format_history
 from app.agent.llm_factory import get_llm, to_text
 from app.agent.state import WorkerResult
 from app.agent.tools.flight_tools import FLIGHT_TOOLS
+
+logger = logging.getLogger(__name__)
 
 #SYSTEM_PROMPT = ("You are a flight booking assistant. Search flights, check/list the user's calendar, "
 #                  "and book flights. Check calendar availability before booking if the user hasn't "
@@ -52,6 +56,7 @@ class FlightBookingState(TypedDict):
     user_id: str
     worker_results: Annotated[list[WorkerResult], operator.add]
     messages: Annotated[list[BaseMessage], add_messages]
+    _agent_error: bool
 
 
 @lru_cache(maxsize=1)
@@ -62,23 +67,49 @@ def _llm_with_tools():
 def agent(state: FlightBookingState) -> dict:
     messages = state.get("messages")
     if not messages:
-        # First call: seed with system+user and PERSIST both into state,
-        # not just use them locally for this one invoke.
-        seed = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=state["input_text"])]
-        response = _llm_with_tools().invoke(seed)
+        # First call: seed with system+(recent context)+user and PERSIST all
+        # into state, not just use them locally for this one invoke.
+        # This is a brand-new subgraph invocation each turn (Send() creates
+        # a fresh task), so without the recent-conversation block the agent
+        # has no idea what flight/date the user is now confirming — it
+        # would only see e.g. "يوم 25 اغسطس" with no prior search results.
+        history_block = format_history((state.get("metadata") or {}).get("_history"))
+        seed = [SystemMessage(content=SYSTEM_PROMPT)]
+        if history_block:
+            seed.append(SystemMessage(
+                content=f"Recent conversation so far (flights/dates already discussed):\n{history_block}"
+            ))
+        seed.append(HumanMessage(content=state["input_text"]))
+        try:
+            response = _llm_with_tools().invoke(seed)
+        except Exception:
+            logger.exception("flight_booking agent: LLM call failed on first turn")
+            return {"messages": seed, "_agent_error": True}
         return {"messages": seed + [response]}
-    response = _llm_with_tools().invoke(messages)
+    try:
+        response = _llm_with_tools().invoke(messages)
+    except Exception:
+        logger.exception("flight_booking agent: LLM call failed")
+        return {"_agent_error": True}
     return {"messages": [response]}
 
 
 def should_continue(state: FlightBookingState) -> str:
+    if state.get("_agent_error"):
+        return "finalize"
     last = state["messages"][-1]
     return "tools" if isinstance(last, AIMessage) and last.tool_calls else "finalize"
 
 
 def finalize(state: FlightBookingState) -> dict:
-    wr = WorkerResult(task_id=state["task_id"], task_type="flight_booking", status="completed",
-                       summary=to_text(state["messages"][-1].content), data={})
+    if state.get("_agent_error") or not state.get("messages"):
+        summary = "معلش، حصل عطل وأنا بدور على الرحلات. جرب تاني كمان شوية."
+        status = "failed"
+    else:
+        summary = to_text(state["messages"][-1].content)
+        status = "completed"
+    wr = WorkerResult(task_id=state["task_id"], task_type="flight_booking", status=status,
+                       summary=summary, data={})
     return {"worker_results": [wr]}
 
 

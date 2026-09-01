@@ -1,5 +1,6 @@
 """Worker 7 — linear chain: build a good arXiv query, search, summarize.
 No Send fan-out needed — nothing here is parallel."""
+import logging
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -7,6 +8,8 @@ from pydantic import BaseModel, Field
 from app.agent.llm_factory import get_llm, to_text
 from app.agent.state import WorkerResult
 from app.agent.tools.arxiv_tool import search_arxiv
+
+logger = logging.getLogger(__name__)
 
 
 class PaperResult(BaseModel):
@@ -24,22 +27,37 @@ class ResearchAnswer(BaseModel):
 
 
 def research_worker(task: dict) -> dict:
-    query = to_text(get_llm(temperature=0.2).invoke(
-        f"Turn this into a 2-4 word arXiv keyword search query (no punctuation, no explanation): "
-        f"{task['input_text']}"
-    ).content).strip()
+    try:
+        query = to_text(get_llm(temperature=0.2).invoke(
+            f"Turn this into a 2-4 word arXiv keyword search query (no punctuation, no explanation): "
+            f"{task['input_text']}"
+        ).content).strip()
+    except Exception:
+        logger.exception("research_worker: query-generation LLM call failed")
+        wr = WorkerResult(task_id=task["task_id"], task_type="research_assistant", status="failed",
+                           summary="معلش، مقدرتش أبحث في الموضوع ده دلوقتي.", data={})
+        return {"worker_results": [wr]}
 
-    raw_papers = search_arxiv(query, max_results=5)
+    try:
+        raw_papers = search_arxiv(query, max_results=5)
+    except Exception:
+        logger.exception("research_worker: arXiv search failed")
+        raw_papers = []
 
     if not raw_papers:
         result = ResearchAnswer(query_used=query, papers=[],
                                  note="No strong matches — try broadening the topic.")
     else:
-        result: ResearchAnswer = get_llm(ResearchAnswer).invoke(
-            f"Query used: {query}\n\nRank and write an original 1-2 sentence relevance note per paper "
-            f"(don't copy the abstract) for the user's request: {task['input_text']}\n\n"
-            f"Papers:\n{raw_papers}"
-        )
+        try:
+            result: ResearchAnswer = get_llm(ResearchAnswer).invoke(
+                f"Query used: {query}\n\nRank and write an original 1-2 sentence relevance note per paper "
+                f"(don't copy the abstract) for the user's request: {task['input_text']}\n\n"
+                f"Papers:\n{raw_papers}"
+            )
+        except Exception:
+            logger.exception("research_worker: ranking LLM call failed")
+            result = ResearchAnswer(query_used=query, papers=[],
+                                     note="لقيت أوراق بس حصل عطل وأنا بلخصها. جرب تاني.")
 
     summary = (f"Found {len(result.papers)} papers for '{result.query_used}'."
                if result.papers else result.note)

@@ -3,6 +3,7 @@
 Compiled as its own subgraph, added as a node in the top-level graph so it
 shares the top-level checkpointer (required for interrupt()).
 """
+import logging
 import operator
 from typing import Annotated, Literal
 
@@ -11,8 +12,11 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
+from app.agent.context import format_history
 from app.agent.llm_factory import get_llm, to_text
 from app.agent.state import WorkerResult
+
+logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 
@@ -34,22 +38,41 @@ class EmailWriteState(TypedDict):
     human_feedback: str
     human_action: Literal["approve", "edit", "reject", ""]
     revision_count: int
+    _draft_error: bool
 
 
 def draft_email(state: EmailWriteState) -> dict:
     feedback = state.get("evaluator_feedback") or state.get("human_feedback") or ""
+    history_block = format_history((state.get("metadata") or {}).get("_history"))
     prompt = f"Instructions: {state['input_text']}"
+    if history_block and state.get("revision_count", 0) == 0:
+        # Only needed to resolve what a short follow-up refers to on the
+        # very first draft; revisions already have full context in `prompt`.
+        prompt = f"Recent conversation for context:\n{history_block}\n\n{prompt}"
     if feedback:
         prompt += f"\n\nRevise based on this feedback: {feedback}"
-    draft = to_text(get_llm(temperature=0.6).invoke(prompt).content)
-    return {"draft": draft, "revision_count": state.get("revision_count", 0) + 1}
+    try:
+        draft = to_text(get_llm(temperature=0.6).invoke(prompt).content)
+    except Exception:
+        logger.exception("email_write draft_email: LLM call failed")
+        draft = state.get("draft") or ""
+        return {"draft": draft, "revision_count": state.get("revision_count", 0) + 1, "_draft_error": True}
+    return {"draft": draft, "revision_count": state.get("revision_count", 0) + 1, "_draft_error": False}
 
 
 def evaluate_email(state: EmailWriteState) -> dict:
-    ev: EmailEvaluation = get_llm(EmailEvaluation).invoke(
-        f"Instructions: {state['input_text']}\n\nDraft:\n{state['draft']}\n\n"
-        f"Approve only if it fully satisfies the instructions, tone, and length."
-    )
+    if state.get("_draft_error"):
+        # Drafting itself failed — skip straight to human review rather than
+        # evaluating an empty/stale draft in a loop.
+        return {"evaluator_feedback": "", "_approved": True}
+    try:
+        ev: EmailEvaluation = get_llm(EmailEvaluation).invoke(
+            f"Instructions: {state['input_text']}\n\nDraft:\n{state['draft']}\n\n"
+            f"Approve only if it fully satisfies the instructions, tone, and length."
+        )
+    except Exception:
+        logger.exception("email_write evaluate_email: LLM call failed")
+        return {"evaluator_feedback": "", "_approved": True}
     return {"evaluator_feedback": "" if ev.approved else ev.feedback, "_approved": ev.approved}
 
 

@@ -1,6 +1,7 @@
 """Worker 3 — Router + Parallelization. One LLM call classifies+extracts
 items, then a second, stricter per-category pass fans out via Send.
 persist_and_embed is the only function allowed to write to memory."""
+import logging
 import operator
 from enum import Enum
 from typing import Annotated, Optional
@@ -13,6 +14,8 @@ from typing_extensions import TypedDict
 from app.agent.llm_factory import get_llm
 from app.agent.memory.vector_store import persist_and_embed
 from app.agent.state import WorkerResult
+
+logger = logging.getLogger(__name__)
 
 
 class ItemCategory(str, Enum):
@@ -69,10 +72,14 @@ class ExtractInfoState(TypedDict):
 
 
 def extract_and_classify(state: ExtractInfoState) -> dict:
-    result: ExtractionRouterOutput = get_llm(ExtractionRouterOutput).invoke(
-        f"Extract every meeting/business/medical/social item from this text(Egyptian Arabic / English), tagging each with its "
-        f"category:\n\n{state['input_text']}"
-    )
+    try:
+        result: ExtractionRouterOutput = get_llm(ExtractionRouterOutput).invoke(
+            f"Extract every meeting/business/medical/social item from this text(Egyptian Arabic / English), tagging each with its "
+            f"category:\n\n{state['input_text']}"
+        )
+    except Exception:
+        logger.exception("extract_info: classify LLM call failed")
+        return {"_items": []}
     return {"_items": result.items}
 
 
@@ -90,9 +97,16 @@ def _make_refiner(category: ItemCategory):
 
     def refine(state: ExtractInfoState) -> dict:
         item = state["item"]
-        refined = get_llm(schema).invoke(
-            f"Extract precise {category.value} fields from: {item['raw_snippet']}"
-        )
+        try:
+            refined = get_llm(schema).invoke(
+                f"Extract precise {category.value} fields from: {item['raw_snippet']}"
+            )
+        except Exception:
+            logger.exception("extract_info: refine(%s) LLM call failed", category.value)
+            # Fall back to the coarse item from the first pass rather than
+            # silently dropping it — a partial extraction beats none.
+            return {"refined_items": [{"category": category.value, "title": item.get("title", ""),
+                                        "date": item.get("date"), "time": item.get("time")}]}
         return {"refined_items": [{"category": category.value, **refined.model_dump()}]}
 
     return refine
@@ -107,8 +121,11 @@ refine_social = _make_refiner(ItemCategory.SOCIAL)
 def extract_join(state: ExtractInfoState) -> dict:
     items = state.get("refined_items") or []
     for item in items:
-        persist_and_embed(state["user_id"], f"extracted_{item['category']}", state["task_id"], str(item))
-    summary = f"Extracted {len(items)} item(s): " + ", ".join(i["title"] for i in items) if items else "No items found."
+        try:
+            persist_and_embed(state["user_id"], f"extracted_{item['category']}", state["task_id"], str(item))
+        except Exception:
+            logger.exception("extract_info: persist_and_embed failed for %s", item.get("category"))
+    summary = f"Extracted {len(items)} item(s): " + ", ".join(i.get("title", "") for i in items) if items else "No items found."
     wr = WorkerResult(task_id=state["task_id"], task_type="extract_info", status="completed",
                        summary=summary, data={"items": items})
     return {"worker_results": [wr]}
