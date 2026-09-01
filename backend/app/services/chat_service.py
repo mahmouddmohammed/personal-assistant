@@ -10,6 +10,12 @@ from sqlalchemy.orm import Session
 
 from app.agent.graph_service import graph_service
 from app.exceptions import ConversationNotFoundError
+
+# How many prior messages (user+assistant combined) to hand to the graph as
+# context each turn. Kept small on purpose (PRESERVE TOKENS) — this only
+# needs to be enough for the orchestrator/continuity-sensitive workers to
+# resolve a short follow-up, not a full transcript.
+HISTORY_WINDOW = 8
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.session_log import SessionLog
@@ -98,11 +104,23 @@ class ChatService:
             requires_feedback=itype == "email_review",
         )
 
+    def _recent_history(self, conversation_id: str) -> list[dict]:
+        """Compact {role, content} pairs for the last HISTORY_WINDOW messages,
+        oldest first — fetched BEFORE the new user message is persisted, so
+        it's genuinely "what happened before this turn"."""
+        prior = self.messages.list_for_conversation(conversation_id)[-HISTORY_WINDOW:]
+        return [
+            {"role": m.role, "content": m.content}
+            for m in prior
+            if not m.is_pending_interrupt  # "[Waiting for your input — ...]" placeholders add no value
+        ]
+
     def send_message(self, user_id: str, message: str, conversation_id: Optional[str]) -> ChatResponse:
         conv = self._get_or_create_conversation(user_id, conversation_id, title_hint=message)
+        history = self._recent_history(conv.id)
         self.messages.add(Message(conversation_id=conv.id, role="user", content=message))
 
-        trace, pending_raw, final_response = graph_service.run_turn(conv.id, user_id, message)
+        trace, pending_raw, final_response = graph_service.run_turn(conv.id, user_id, message, history)
         self._persist_trace(conv, user_id, trace)
 
         pending = None

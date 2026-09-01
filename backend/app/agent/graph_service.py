@@ -97,24 +97,48 @@ class GraphService:
         config = {"configurable": {"thread_id": thread_id}}
         state = self.graph.get_state(config)
         if state.next:
-            interrupt_value = state.tasks[0].interrupts[0].value
-            return interrupt_value, None
+            if state.tasks and state.tasks[0].interrupts:
+                return state.tasks[0].interrupts[0].value, None
+            logger.warning("Graph paused on thread %s with no interrupt payload", thread_id)
+            return None, state.values.get("final_response", "")
         final_response = state.values.get("final_response", "")
         return None, final_response
 
-    def run_turn(self, thread_id: str, user_id: str, message: str):
+    def run_turn(self, thread_id: str, user_id: str, message: str, history: Optional[list[dict]] = None):
         """Starts (or continues, on a fresh thread) a top-level graph turn.
+
+        `history` is the recent-turns context (list of {"role","content"}),
+        supplied by chat_service from persisted messages — it has no
+        reducer in AssistantState, so it's simply overwritten each turn.
 
         Returns (trace, pending_interrupt_or_None, final_response_or_None).
         """
-        payload = {"user_id": user_id, "user_input": message, "worker_results": []}
-        trace = self._drain(payload, thread_id)
-        pending, final_response = self._read_result(thread_id)
+        payload = {
+            "user_id": user_id, "user_input": message,
+            "history": history or [], "worker_results": [],
+        }
+        try:
+            trace = self._drain(payload, thread_id)
+            pending, final_response = self._read_result(thread_id)
+        except Exception:
+            # Last-resort safety net: an unhandled exception anywhere in the
+            # graph used to bubble all the way up into a 500 (this is the
+            # crash the /health logs were showing). Individual nodes now
+            # catch their own LLM/tool errors, but this still protects
+            # against anything that slips through (bad graph wiring,
+            # checkpointer hiccups, etc.) so the user gets a message back
+            # instead of a broken request.
+            logger.exception("graph_service.run_turn: unhandled error on thread %s", thread_id)
+            return [], None, "معلش، حصل عطل غير متوقع وأنا بحاول أصلحه. ممكن تجرب تاني؟"
         return trace, pending, final_response
 
     def resume_turn(self, thread_id: str, resume_value: Any):
-        trace = self._drain(Command(resume=resume_value), thread_id)
-        pending, final_response = self._read_result(thread_id)
+        try:
+            trace = self._drain(Command(resume=resume_value), thread_id)
+            pending, final_response = self._read_result(thread_id)
+        except Exception:
+            logger.exception("graph_service.resume_turn: unhandled error on thread %s", thread_id)
+            return [], None, "معلش، حصل عطل غير متوقع وأنا بحاول أصلحه. ممكن تجرب تاني؟"
         return trace, pending, final_response
 
     @staticmethod
