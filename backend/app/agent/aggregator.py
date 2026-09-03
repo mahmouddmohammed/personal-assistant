@@ -9,22 +9,35 @@ state.py / orchestrator.py), so this node no longer has to worry about
 results left over from earlier turns bleeding into the reply."""
 import logging
 
-from app.agent.context import format_history
+from app.agent.context import format_context
 from app.agent.llm_factory import get_llm, to_text
 from app.agent.state import AssistantState
 
 logger = logging.getLogger(__name__)
 
 
+_CONVERSATIONAL_SYSTEM_PROMPT = (
+    "You are a helpful personal assistant. Reply conversationally, in the same "
+    "language/dialect the user is using. You may be given conversation context "
+    "(an older summary and/or recent messages). **Use that context only to "
+    "understand references the current message actually makes (pronouns like "
+    "it/that/ده/دي, or an obvious continuation of something left hanging, like "
+    "confirming a choice you just offered).** "
+    "**If the current message stands on its own and doesn't reference or continue "
+    "anything in that context, treat it as a fresh, unrelated remark and just "
+    "respond to it directly — do not steer the reply back toward an earlier topic "
+    "the user didn't bring up again.**"
+)
+
+
 def aggregator_node(state: AssistantState) -> dict:
     results = state.get("worker_results") or []
 
     if not results:
-        history_block = format_history(state.get("history"))
-        messages = [{"role": "system", "content": "You are a helpful personal assistant. Reply conversationally, "
-                                                    "in the same language/dialect the user is using."}]
-        if history_block:
-            messages.append({"role": "system", "content": f"Recent conversation:\n{history_block}"})
+        context_block = format_context(state.get("summary"), state.get("history"))
+        messages = [{"role": "system", "content": _CONVERSATIONAL_SYSTEM_PROMPT}]
+        if context_block:
+            messages.append({"role": "system", "content": f"Conversation context:\n{context_block}"})
         messages.append({"role": "user", "content": state["user_input"]})
         try:
             reply = get_llm(temperature=0.5).invoke(messages)

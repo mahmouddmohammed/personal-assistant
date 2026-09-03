@@ -12,7 +12,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
-from app.agent.context import format_history
+from app.agent.context import format_context
 from app.agent.llm_factory import get_llm, to_text
 from app.agent.state import WorkerResult
 
@@ -43,12 +43,12 @@ class EmailWriteState(TypedDict):
 
 def draft_email(state: EmailWriteState) -> dict:
     feedback = state.get("evaluator_feedback") or state.get("human_feedback") or ""
-    history_block = format_history((state.get("metadata") or {}).get("_history"))
+    meta = state.get("metadata") or {}
+    context_block = format_context(meta.get("_summary"), meta.get("_history"))
     prompt = f"Instructions: {state['input_text']}"
-    if history_block and state.get("revision_count", 0) == 0:
+    if context_block and state.get("revision_count", 0) == 0:
         # Only needed to resolve what a short follow-up refers to on the
-        # very first draft; revisions already have full context in `prompt`.
-        prompt = f"Recent conversation for context:\n{history_block}\n\n{prompt}"
+        prompt = f"Conversation context:\n{context_block}\n\n{prompt}"
     if feedback:
         prompt += f"\n\nRevise based on this feedback: {feedback}"
     try:

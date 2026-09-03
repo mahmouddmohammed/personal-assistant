@@ -3,19 +3,30 @@ LangGraph facade, persists messages + the per-node execution trace, and
 translates a paused graph into a `PendingInterrupt` the frontend can render
 as buttons.
 """
+import logging
 import uuid
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
 from app.agent.graph_service import graph_service
+from app.agent.llm_factory import get_llm, to_text
 from app.exceptions import ConversationNotFoundError
 
+logger = logging.getLogger(__name__)
+
 # How many prior messages (user+assistant combined) to hand to the graph as
-# context each turn. Kept small on purpose (PRESERVE TOKENS) — this only
-# needs to be enough for the orchestrator/continuity-sensitive workers to
-# resolve a short follow-up, not a full transcript.
+# raw context each turn. Kept small on purpose (PRESERVE TOKENS) — this
+# only needs to be enough for the orchestrator/continuity-sensitive workers
+# to resolve a short follow-up, not a full transcript. Anything older than
+# this window is folded into `Conversation.summary` instead of just being
+# dropped — see `_maybe_update_summary` below.
 HISTORY_WINDOW = 8
+
+# Only start summarizing once a conversation has grown past this many
+# messages — short conversations never lose anything to the truncation
+# window in the first place, so there's nothing worth summarizing yet.
+SUMMARY_TRIGGER_MESSAGES = 20
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.session_log import SessionLog
@@ -38,6 +49,14 @@ _INTERRUPT_ACTIONS: dict[str, list[InterruptAction]] = {
     "confirm_booking": [
         InterruptAction(action="confirm", label="Confirm booking"),
         InterruptAction(action="cancel", label="Cancel"),
+    ],
+    "confirm_cancel_booking": [
+        InterruptAction(action="confirm", label="Yes, cancel it"),
+        InterruptAction(action="cancel", label="No, keep it"),
+    ],
+    "confirm_modify_booking": [
+        InterruptAction(action="confirm", label="Yes, change it"),
+        InterruptAction(action="cancel", label="No, keep original"),
     ],
 }
 
@@ -115,12 +134,61 @@ class ChatService:
             if not m.is_pending_interrupt  # "[Waiting for your input — ...]" placeholders add no value
         ]
 
+    def _maybe_update_summary(self, conv: Conversation) -> None:
+        """Folds messages that have aged out of HISTORY_WINDOW into
+        `conv.summary`, instead of letting them just disappear.
+
+        Runs BEFORE the new user message is persisted (same ordering as
+        `_recent_history`), and only touches the slice of messages between
+        what's already summarized (`summary_through`) and what's about to
+        fall outside the raw window — so nothing is summarized twice and
+        nothing in the raw window is redundantly summarized early.
+        """
+        all_msgs = self.messages.list_for_conversation(conv.id)
+        total = len(all_msgs)
+        if total < SUMMARY_TRIGGER_MESSAGES:
+            return
+
+        already = conv.summary_through or 0
+        fold_end = max(0, total - HISTORY_WINDOW)
+        if fold_end <= already:
+            return  # nothing new has aged out of the window since last time
+
+        new_slice = [m for m in all_msgs[already:fold_end] if not m.is_pending_interrupt]
+        if not new_slice:
+            conv.summary_through = fold_end
+            return
+
+        text_block = "\n".join(f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}" for m in new_slice)
+        if conv.summary:
+            prompt = (f"This is the summary of the conversation so far:\n{conv.summary}\n\n"
+                      "Extend the summary by taking into account the new messages below. Keep it concise, "
+                      "and keep concrete facts (names, dates, flight/booking ids, decisions made) intact "
+                      "rather than vaguely paraphrasing them away.\n\n" + text_block)
+        else:
+            prompt = ("Create a concise summary of the conversation below. Keep concrete facts (names, "
+                      "dates, flight/booking ids, decisions made) intact rather than vaguely paraphrasing "
+                      "them away.\n\n" + text_block)
+
+        try:
+            response = get_llm(temperature=0.2).invoke(prompt)
+            conv.summary = to_text(response.content)
+            conv.summary_through = fold_end
+        except Exception:
+            # Non-fatal: worst case we fall back to the old behavior (raw
+            # window only, older context missing) for this turn and retry
+            # on the next one — never blocks the actual chat turn.
+            logger.exception("chat_service: summary update failed for conversation %s", conv.id)
+
     def send_message(self, user_id: str, message: str, conversation_id: Optional[str]) -> ChatResponse:
         conv = self._get_or_create_conversation(user_id, conversation_id, title_hint=message)
+        self._maybe_update_summary(conv)
         history = self._recent_history(conv.id)
         self.messages.add(Message(conversation_id=conv.id, role="user", content=message))
 
-        trace, pending_raw, final_response = graph_service.run_turn(conv.id, user_id, message, history)
+        trace, pending_raw, final_response = graph_service.run_turn(
+            conv.id, user_id, message, history, summary=conv.summary or "",
+        )
         self._persist_trace(conv, user_id, trace)
 
         pending = None

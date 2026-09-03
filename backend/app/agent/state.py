@@ -21,17 +21,15 @@ TaskType = Literal[
     "summarize", "qa", "flight_booking", "research_assistant",
 ]
 
-
-class SubTask(BaseModel):
+class PlannedTask(BaseModel):
     task_id: str = Field(description="short unique id, e.g. 't1', 't2'")
     task_type: TaskType
     input_text: str = Field(description="the slice of the user's message relevant to this task, verbatim")
-    metadata: dict = Field(default_factory=dict)
 
 
 class OrchestratorPlan(BaseModel):
     reasoning: str = Field(description="brief note on how the message was decomposed")
-    tasks: list[SubTask]
+    tasks: list[PlannedTask]
 
 
 class WorkerResult(BaseModel):
@@ -62,14 +60,50 @@ def _reduce_worker_results(existing: list[WorkerResult], new: list) -> list[Work
     return list(existing) + list(new)
 
 
+class BookingSlot(BaseModel):
+    """Structured record of the flight the user is *currently* searching /
+    about to confirm / just booked or cancelled -- kept in the top-level,
+    checkpointed `AssistantState` (NOT the flight_booking subgraph's own
+    `messages`, which do not survive across turns since every turn is a
+    fresh `Send()` invocation of that subgraph).
+
+    This is what actually fixes the bug documented in
+    `documentation/check.md` turn 2: without this, the agent has no
+    structured `flight_id` to pass to `book_flight` on the confirming
+    turn -- only a plain-text history sentence with no id in it -- so it
+    re-asks "is this the one you meant?" instead of booking.
+
+    This slot only ever tracks the ONE booking currently in flight through
+    the search -> confirm -> book/modify/cancel conversation. Once a
+    booking reaches "booked", the fact of its existence lives permanently
+    in the `bookings` DB table (see app/models/booking.py), scoped by
+    user_id -- this slot is not a list of a user's bookings and is allowed
+    to be overwritten by the next search.
+    """
+    status: Literal["none", "searching", "awaiting_confirmation", "booked", "cancelled"] = "none"
+    flight_id: Optional[str] = None
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+    date: Optional[str] = None
+    passenger_name: Optional[str] = None
+    booking_ref: Optional[str] = None
+
+
+def _merge_booking(existing: BookingSlot, new: Optional[BookingSlot]) -> BookingSlot:
+    """Last-write-wins; `None` means "no update this step" (the node simply
+    didn't touch booking state), NOT "clear it". Nodes that genuinely want
+    to reset the slot (e.g. after a cancellation) must return an explicit
+    `BookingSlot()` (status="none"), not None."""
+    return new if new is not None else existing
+
+
 class AssistantState(TypedDict):
     user_id: str
+    conversation_id: str
     user_input: str
-    # Compact recent turns (list of {"role", "content"}), oldest first.
-    # Supplied fresh by chat_service on every call to run_turn — this key
-    # has NO reducer, so (unlike worker_results) it's simply overwritten
-    # each turn rather than accumulated, which is exactly what we want.
     history: list[dict]
+    summary: str
     plan: Optional[OrchestratorPlan]
     worker_results: Annotated[list[WorkerResult], _reduce_worker_results]
+    active_booking: Annotated[BookingSlot, _merge_booking]
     final_response: str

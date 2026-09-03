@@ -14,7 +14,7 @@ import logging
 
 from langgraph.types import Send
 
-from app.agent.context import format_history
+from app.agent.context import format_context
 from app.agent.llm_factory import get_llm
 from app.agent.state import RESET_WORKER_RESULTS, AssistantState, OrchestratorPlan
 
@@ -26,7 +26,9 @@ SYSTEM_PROMPT = """You decompose a user's message into subtasks for these worker
 - extract_info: pull out NEW meetings/business/medical/social items to remember for later recall
 - summarize: summarize a chunk of text if user asks you to summarize
 - qa: answer a question using previously stored memory
-- flight_booking: search/check/choose/confirm/book flights, or continue an in-progress flight search or booking
+- flight_booking: search/check/choose/confirm/book flights, cancel or change an existing
+  booking, list what the user has already booked, or continue an in-progress flight
+  search/booking/cancellation
 - research_assistant: find arXiv papers on a topic
 
 Rules:
@@ -44,6 +46,10 @@ Rules:
   remembered — not for continuing an in-progress booking or search.
 - Likewise, a short "yes/confirm/ابعتها/عدلها" right after an email draft was shown is an
   email_write continuation, not a new task.
+- "Cancel/delete/change my flight" (in any wording, e.g. "الغي الرحلة اللي حجزتها",
+  "عايز اغير معاد الرحلة") is a flight_booking task even with no flight_id mentioned —
+  the worker itself will look up the user's booking(s) and ask which one if it's ambiguous.
+  Do NOT route this to extract_info or qa just because no explicit id was given.
 
 Examples:
 English:
@@ -77,13 +83,13 @@ def _fallback_plan(reason: str) -> OrchestratorPlan:
 
 
 def orchestrator_node(state: AssistantState) -> dict:
-    history_block = format_history(state.get("history"))
+    context_block = format_context(state.get("summary"), state.get("history"))
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if history_block:
+    if context_block:
         messages.append({
             "role": "system",
-            "content": f"Recent conversation (context only — see rules above):\n{history_block}",
+            "content": f"Conversation context (see rules above for how to use it):\n{context_block}",
         })
     messages.append({"role": "user", "content": state["user_input"]})
 
@@ -92,9 +98,7 @@ def orchestrator_node(state: AssistantState) -> dict:
     except Exception as exc:  # LLM/API hiccup should never crash the whole turn
         plan = _fallback_plan(str(exc))
 
-    # RESET_WORKER_RESULTS must be emitted here (not in dispatch) because
-    # orchestrator_node is the one node that runs exactly once at the start
-    # of every turn, before any worker Send() has a chance to append.
+    
     return {"plan": plan, "worker_results": [RESET_WORKER_RESULTS]}
 
 
@@ -104,13 +108,17 @@ def dispatch(state: AssistantState) -> list[Send]:
         return [Send("aggregator", state)]
 
     history = state.get("history") or []
-    return [
-        Send(f"{t.task_type}_worker", {
+    summary = state.get("summary") or ""
+
+    def _payload(t) -> dict:
+        payload = {
             "task_id": t.task_id, "task_type": t.task_type, "input_text": t.input_text,
-            # Continuity-sensitive workers (flight_booking, email_write) read
-            # metadata["_history"]; everyone else just ignores the extra key.
-            "metadata": {**t.metadata, "_history": history},
+            "metadata": {"_history": history, "_summary": summary},
             "user_id": state["user_id"], "worker_results": [],
-        })
-        for t in tasks
-    ]
+        }
+        if t.task_type == "flight_booking":
+            payload["active_booking"] = state.get("active_booking")
+            payload["conversation_id"] = state.get("conversation_id")
+        return payload
+
+    return [Send(f"{t.task_type}_worker", _payload(t)) for t in tasks]

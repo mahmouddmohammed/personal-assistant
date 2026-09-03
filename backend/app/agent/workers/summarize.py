@@ -18,10 +18,22 @@ class SummaryResult(BaseModel):
 
 
 def summarize_worker(task: dict) -> dict:
-    try:
-        result: SummaryResult = get_llm(SummaryResult).invoke(f"Summarize:\n\n{task['input_text']}")
-    except Exception:
-        logger.exception("summarize_worker: LLM call failed")
+    llm = get_llm(SummaryResult)
+    prompt = f"Summarize:\n\n{task['input_text']}"
+    result = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            result = llm.invoke(prompt)
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("summarize_worker: attempt %d failed for task_id=%s input_text=%r: %s",
+                            attempt + 1, task.get("task_id"), task.get("input_text"), exc)
+
+    if result is None:
+        logger.error("summarize_worker: giving up after retries for task_id=%s input_text=%r",
+                      task.get("task_id"), task.get("input_text"), exc_info=last_exc)
         wr = WorkerResult(task_id=task["task_id"], task_type="summarize", status="failed",
                            summary="معلش، مقدرتش ألخص النص ده دلوقتي.", data={})
         return {"worker_results": [wr]}

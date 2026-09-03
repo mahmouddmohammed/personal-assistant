@@ -97,37 +97,42 @@ class GraphService:
         config = {"configurable": {"thread_id": thread_id}}
         state = self.graph.get_state(config)
         if state.next:
-            if state.tasks and state.tasks[0].interrupts:
-                return state.tasks[0].interrupts[0].value, None
+            # Multiple workers can be fanned out via Send() in the same step
+            # (e.g. summarize + email_write dispatched together). Only ONE of
+            # them may actually call interrupt() (email_write's human review),
+            # and state.tasks does not guarantee that task is first — a
+            # finished, non-interrupting task can sit at index 0. Checking
+            # only tasks[0] silently dropped real interrupts that landed
+            # later in the list (see incident 2026-09-03).
+            for task in state.tasks:
+                if task.interrupts:
+                    return task.interrupts[0].value, None
             logger.warning("Graph paused on thread %s with no interrupt payload", thread_id)
             return None, state.values.get("final_response", "")
         final_response = state.values.get("final_response", "")
         return None, final_response
 
-    def run_turn(self, thread_id: str, user_id: str, message: str, history: Optional[list[dict]] = None):
+    def run_turn(self, thread_id: str, user_id: str, message: str, history: Optional[list[dict]] = None,
+                 summary: str = ""):
         """Starts (or continues, on a fresh thread) a top-level graph turn.
 
         `history` is the recent-turns context (list of {"role","content"}),
-        supplied by chat_service from persisted messages — it has no
-        reducer in AssistantState, so it's simply overwritten each turn.
+        and `summary` is the persisted running summary of anything older
+        than that window (see chat_service._maybe_update_summary) — both
+        supplied fresh by chat_service from persisted state each call, and
+        both have no reducer in AssistantState, so they're simply
+        overwritten each turn rather than accumulated.
 
         Returns (trace, pending_interrupt_or_None, final_response_or_None).
         """
         payload = {
-            "user_id": user_id, "user_input": message,
-            "history": history or [], "worker_results": [],
+            "user_id": user_id, "conversation_id": thread_id, "user_input": message,
+            "history": history or [], "summary": summary, "worker_results": [],
         }
         try:
             trace = self._drain(payload, thread_id)
             pending, final_response = self._read_result(thread_id)
         except Exception:
-            # Last-resort safety net: an unhandled exception anywhere in the
-            # graph used to bubble all the way up into a 500 (this is the
-            # crash the /health logs were showing). Individual nodes now
-            # catch their own LLM/tool errors, but this still protects
-            # against anything that slips through (bad graph wiring,
-            # checkpointer hiccups, etc.) so the user gets a message back
-            # instead of a broken request.
             logger.exception("graph_service.run_turn: unhandled error on thread %s", thread_id)
             return [], None, "معلش، حصل عطل غير متوقع وأنا بحاول أصلحه. ممكن تجرب تاني؟"
         return trace, pending, final_response

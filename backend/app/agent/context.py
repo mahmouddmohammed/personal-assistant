@@ -28,3 +28,21 @@ def format_history(history: list[dict] | None) -> str:
             content = content[:MAX_CHARS_PER_TURN] + "…"
         lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+def format_context(summary: str | None, history: list[dict] | None) -> str:
+    """Combines the persisted running summary (everything older than the
+    raw window — see chat_service._maybe_update_summary) with the recent
+    raw turns, into one block callers can drop straight into a prompt.
+
+    Without `summary`, anything past MAX_HISTORY_TURNS used to just
+    vanish with no trace — a fact mentioned 10 turns ago was gone forever,
+    not condensed. This is the fix for that: older context degrades to a
+    summary instead of disappearing outright."""
+    parts = []
+    if summary and summary.strip():
+        parts.append(f"Summary of the conversation before that (older context):\n{summary.strip()}")
+    recent = format_history(history)
+    if recent:
+        parts.append(f"Most recent messages:\n{recent}")
+    return "\n\n".join(parts)
