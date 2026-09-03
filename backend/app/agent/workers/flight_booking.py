@@ -1,28 +1,22 @@
-"""Worker 6 — standard ReAct tool-calling loop. Only book_flight
-(side-effecting) pauses for confirmation — search/check/list are
-read-only and run freely."""
+"""Worker 6 — standard ReAct tool-calling loop. Only book_flight,
+cancel_flight, and modify_flight (side-effecting) pause for confirmation —
+search/check/list are read-only and run freely.
+"""
 import logging
 import operator
-from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Optional
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
-from app.agent.context import format_history
+from app.agent.context import format_context
 from app.agent.llm_factory import get_llm, to_text
-from app.agent.state import WorkerResult
-from app.agent.tools.flight_tools import FLIGHT_TOOLS
+from app.agent.state import BookingSlot, WorkerResult, _merge_booking
+from app.agent.tools.flight_tools import build_flight_tools
 
 logger = logging.getLogger(__name__)
-
-#SYSTEM_PROMPT = ("You are a flight booking assistant. Search flights, check/list the user's calendar, "
-#                  "and book flights. Check calendar availability before booking if the user hasn't "
-#                  "confirmed the time works. Never call book_flight without a specific flight_id and "
-#                  "the passenger's name.")
-
 
 SYSTEM_PROMPT = """You are a friendly voice+text flight booking assistant.
 
@@ -44,9 +38,18 @@ Workflow you must follow:
 5. After booking, tell the user it's booked and that a link to add it to their Google Calendar is
    shown in the chat.
 6. If the user asks what they've booked, call list_calendar_events.
+7. If the user wants to cancel a booking: if you already know which booking_ref they mean (from
+   the structured booking-state message below, or because there's exactly one booking from
+   list_calendar_events), call cancel_flight directly with it. If there's more than one active
+   booking and it's not clear which one, call list_calendar_events and ask the user to pick
+   before calling cancel_flight — never guess which booking to cancel.
+8. If the user wants to change/move a booking to a different flight: search_flights for the new
+   option, confirm it with the user, then call modify_flight with the existing booking_ref and
+   the new flight_id. Same rule as cancellation — don't guess the booking_ref if it's ambiguous.
 
 Speak in Egyptian Arabic with code switching with English if needed, if user speaks different language speak the language of the user.
 Keep spoken responses short and conversational. Never invent flight data — always use the tools."""
+
 
 class FlightBookingState(TypedDict):
     task_id: str
@@ -54,44 +57,106 @@ class FlightBookingState(TypedDict):
     input_text: str
     metadata: dict
     user_id: str
+    conversation_id: Optional[str]
     worker_results: Annotated[list[WorkerResult], operator.add]
     messages: Annotated[list[BaseMessage], add_messages]
+    active_booking: Annotated[BookingSlot, _merge_booking]
     _agent_error: bool
 
 
-@lru_cache(maxsize=1)
-def _llm_with_tools():
-    return get_llm().bind_tools(FLIGHT_TOOLS)
+def _slot_from_tool_calls(response) -> Optional[BookingSlot]:
+    """Captures the LLM's own booking/cancel/modify intent the moment it
+    decides to call one of those tools — BEFORE interrupt() pauses the
+    whole graph — so a structured flight_id/booking_ref is already
+    checkpointed even though the tool call itself hasn't completed yet."""
+    if not isinstance(response, AIMessage) or not response.tool_calls:
+        return None
+    for call in response.tool_calls:
+        name, args = call.get("name"), call.get("args") or {}
+        if name == "book_flight":
+            return BookingSlot(status="awaiting_confirmation", flight_id=args.get("flight_id"),
+                                passenger_name=args.get("passenger_name"))
+        if name == "cancel_flight":
+            return BookingSlot(status="awaiting_confirmation", booking_ref=args.get("booking_ref"))
+        if name == "modify_flight":
+            return BookingSlot(status="awaiting_confirmation", booking_ref=args.get("booking_ref"),
+                                flight_id=args.get("new_flight_id"))
+        if name == "search_flights":
+            return BookingSlot(status="searching", origin=args.get("origin") or None,
+                                destination=args.get("destination") or None, date=args.get("date") or None)
+    return None
 
 
 def agent(state: FlightBookingState) -> dict:
+    tools = build_flight_tools(state["user_id"], state.get("conversation_id"))
+    llm_with_tools = get_llm().bind_tools(tools)
+
     messages = state.get("messages")
     if not messages:
-        # First call: seed with system+(recent context)+user and PERSIST all
-        # into state, not just use them locally for this one invoke.
-        # This is a brand-new subgraph invocation each turn (Send() creates
-        # a fresh task), so without the recent-conversation block the agent
-        # has no idea what flight/date the user is now confirming — it
-        # would only see e.g. "يوم 25 اغسطس" with no prior search results.
-        history_block = format_history((state.get("metadata") or {}).get("_history"))
+        meta = state.get("metadata") or {}
+        context_block = format_context(meta.get("_summary"), meta.get("_history"))
         seed = [SystemMessage(content=SYSTEM_PROMPT)]
-        if history_block:
+        if context_block:
             seed.append(SystemMessage(
-                content=f"Recent conversation so far (flights/dates already discussed):\n{history_block}"
+                content=f"Conversation context so far (flights/dates already discussed):\n{context_block}"
             ))
+        booking = state.get("active_booking")
+        if booking and booking.status != "none":
+            seed.append(SystemMessage(content=(
+                "Structured booking state carried over from earlier in this conversation. This is "
+                "more reliable than free text above — use its flight_id/booking_ref directly instead "
+                "of re-deriving or re-confirming it from scratch, unless the user's new message "
+                f"contradicts it: {booking.model_dump_json(exclude_none=True)}"
+            )))
         seed.append(HumanMessage(content=state["input_text"]))
         try:
-            response = _llm_with_tools().invoke(seed)
+            response = llm_with_tools.invoke(seed)
         except Exception:
             logger.exception("flight_booking agent: LLM call failed on first turn")
             return {"messages": seed, "_agent_error": True}
-        return {"messages": seed + [response]}
-    try:
-        response = _llm_with_tools().invoke(messages)
-    except Exception:
-        logger.exception("flight_booking agent: LLM call failed")
-        return {"_agent_error": True}
-    return {"messages": [response]}
+        update: dict = {"messages": seed + [response]}
+    else:
+        try:
+            response = llm_with_tools.invoke(messages)
+        except Exception:
+            logger.exception("flight_booking agent: LLM call failed")
+            return {"_agent_error": True}
+        update = {"messages": [response]}
+
+    slot = _slot_from_tool_calls(response)
+    if slot is not None:
+        update["active_booking"] = slot
+    return update
+
+
+def sync_booking_state(state: FlightBookingState) -> dict:
+    """Runs right after the tools node. Reads the structured `artifact` off
+    the booking-related tools (book_flight/cancel_flight/modify_flight use
+    `response_format="content_and_artifact"` precisely so this doesn't have
+    to re-parse stringified tool output) and reconciles `active_booking`
+    with what actually happened, rather than what the LLM merely asked for.
+    """
+    messages = state.get("messages") or []
+    tool_msgs: list[ToolMessage] = []
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            tool_msgs.append(m)
+        else:
+            break
+    tool_msgs.reverse()
+
+    for tm in tool_msgs:
+        artifact = getattr(tm, "artifact", None)
+        if not isinstance(artifact, dict):
+            continue
+        status = artifact.get("status")
+        if status == "booked":
+            b = artifact.get("booking") or {}
+            return {"active_booking": BookingSlot(status="booked", flight_id=b.get("flight_id"),
+                                                   passenger_name=b.get("passenger_name"), booking_ref=b.get("id"))}
+        if status in ("cancelled", "kept", "error"):
+            return {"active_booking": BookingSlot(status="none")}
+    return {}
 
 
 def should_continue(state: FlightBookingState) -> str:
@@ -113,14 +178,23 @@ def finalize(state: FlightBookingState) -> dict:
     return {"worker_results": [wr]}
 
 
+def tools_node(state: FlightBookingState) -> dict:
+    # Rebuilt per call (not a module-level singleton) since it must be
+    # bound to *this* task's user_id — see build_flight_tools docstring.
+    tools = build_flight_tools(state["user_id"], state.get("conversation_id"))
+    return ToolNode(tools).invoke(state)
+
+
 def build_flight_booking_subgraph():
     g = StateGraph(FlightBookingState)
     g.add_node("agent", agent)
-    g.add_node("tools", ToolNode(FLIGHT_TOOLS))
+    g.add_node("tools", tools_node)
+    g.add_node("sync_booking_state", sync_booking_state)
     g.add_node("finalize", finalize)
     g.add_edge(START, "agent")
     g.add_conditional_edges("agent", should_continue, {"tools": "tools", "finalize": "finalize"})
-    g.add_edge("tools", "agent")
+    g.add_edge("tools", "sync_booking_state")
+    g.add_edge("sync_booking_state", "agent")
     g.add_edge("finalize", END)
     return g.compile()
 
