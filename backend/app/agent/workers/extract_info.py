@@ -107,8 +107,12 @@ def _make_refiner(category: ItemCategory):
             # Fall back to the coarse item from the first pass rather than
             # silently dropping it — a partial extraction beats none.
             return {"refined_items": [{"category": category.value, "title": item.get("title", ""),
-                                        "date": item.get("date"), "time": item.get("time")}]}
-        return {"refined_items": [{"category": category.value, **refined.model_dump()}]}
+                                        "date": item.get("date"), "time": item.get("time"),
+                                        "raw_snippet": item.get("raw_snippet", "")}]}
+
+        # Preserve raw_snippet alongside the refined schema fields so the original wording—and any schema-unsupported details—remains embedded and retrievable.
+        return {"refined_items": [{"category": category.value, **refined.model_dump(),
+                                    "raw_snippet": item.get("raw_snippet", "")}]}
 
     return refine
 
