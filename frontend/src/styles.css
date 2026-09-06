@@ -124,6 +124,7 @@ button {
 .interrupt-feedback { width: 100%; min-height: 60px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 8px; font-size: 13px; margin-bottom: 10px; }
 .interrupt-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
+.chat-error-banner { margin: 0 24px 12px; }
 .chat-input-bar { display: flex; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--border); }
 .chat-input-bar input { flex: 1; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; color: var(--text); font-size: 14px; }
 

@@ -28,6 +28,22 @@ export default function InterruptPrompt({ pending, onResolve, busy }) {
           Book flight <b>{pending.payload.flight_id}</b> for <b>{pending.payload.passenger_name}</b>?
         </div>
       )}
+      {/* BUGFIX: these two interrupt types (defined server-side in
+          chat_service._INTERRUPT_ACTIONS) previously had no matching
+          branch here at all, so the user saw only a header + Yes/No
+          buttons with zero context about *which* booking was about to be
+          cancelled or changed. */}
+      {pending.type === "confirm_cancel_booking" && (
+        <div className="interrupt-draft">
+          Cancel booking <b>{pending.payload.booking_ref}</b>? This can't be undone.
+        </div>
+      )}
+      {pending.type === "confirm_modify_booking" && (
+        <div className="interrupt-draft">
+          Change booking <b>{pending.payload.booking_ref}</b> to flight{" "}
+          <b>{pending.payload.new_flight_id}</b>?
+        </div>
+      )}
 
       {showFeedback && (
         <textarea

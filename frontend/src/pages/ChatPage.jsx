@@ -16,6 +16,7 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const bottomRef = useRef(null);
 
   const refreshConversations = async () => {
@@ -34,6 +35,7 @@ export default function ChatPage() {
   const loadConversation = async (id) => {
     setActiveId(id);
     setPending(null);
+    setError("");
     const { data } = await ChatAPI.getConversation(id);
     setMessages(data.messages.map((m) => ({ role: m.role, content: m.content })));
   };
@@ -42,6 +44,7 @@ export default function ChatPage() {
     setActiveId(null);
     setMessages([]);
     setPending(null);
+    setError("");
   };
 
   const applyResponse = (data) => {
@@ -59,11 +62,22 @@ export default function ChatPage() {
     if (!input.trim() || busy) return;
     const text = input;
     setInput("");
+    setError("");
     setMessages((m) => [...m, { role: "user", content: text }]);
     setBusy(true);
     try {
       const { data } = await ChatAPI.send(text, activeId);
       applyResponse(data);
+    } catch (err) {
+      // BUGFIX: previously any failed request (network error, expired
+      // session, 500, etc.) left the optimistically-added user bubble
+      // sitting there forever with no assistant reply and no feedback —
+      // busy just silently reset via `finally` with nothing telling the
+      // user anything had gone wrong. Now we surface the error and give
+      // the message back so it isn't lost.
+      setMessages((m) => m.slice(0, -1));
+      setInput(text);
+      setError(err?.response?.data?.detail || "Couldn't send that message. Please try again.");
     } finally {
       setBusy(false);
     }
@@ -71,9 +85,12 @@ export default function ChatPage() {
 
   const resolveInterrupt = async (action, feedback) => {
     setBusy(true);
+    setError("");
     try {
       const { data } = await ChatAPI.resume(activeId, action, feedback);
       applyResponse(data);
+    } catch (err) {
+      setError(err?.response?.data?.detail || "Couldn't submit that response. Please try again.");
     } finally {
       setBusy(false);
     }
@@ -108,6 +125,7 @@ export default function ChatPage() {
           {pending && <InterruptPrompt pending={pending} onResolve={resolveInterrupt} busy={busy} />}
           <div ref={bottomRef} />
         </div>
+        {error && <div className="error-banner chat-error-banner">{error}</div>}
         <div className="chat-input-bar">
           <input
             value={input}

@@ -5,6 +5,7 @@ as buttons.
 """
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
@@ -180,6 +181,15 @@ class ChatService:
             # on the next one — never blocks the actual chat turn.
             logger.exception("chat_service: summary update failed for conversation %s", conv.id)
 
+    @staticmethod
+    def _touch(conv: Conversation) -> None:
+        """
+        Assign an actually new timestamp to updated_at so the change is persisted and list_for_user correctly surfaces the most recently active conversation first.
+
+        The bug was that conv.updated_at = conv.updated_at marked the object dirty but did not actually change its value, so SQLAlchemy skipped the UPDATE. As a result, conversations stayed ordered by creation time instead of recent activity.
+        """
+        conv.updated_at = datetime.utcnow()
+
     def send_message(self, user_id: str, message: str, conversation_id: Optional[str]) -> ChatResponse:
         conv = self._get_or_create_conversation(user_id, conversation_id, title_hint=message)
         self._maybe_update_summary(conv)
@@ -201,7 +211,7 @@ class ChatService:
         else:
             self.messages.add(Message(conversation_id=conv.id, role="assistant", content=final_response or ""))
 
-        conv.updated_at = conv.updated_at  # touch handled by onupdate on commit below
+        self._touch(conv)
         self.db.commit()
 
         return ChatResponse(
@@ -234,6 +244,8 @@ class ChatService:
         else:
             self.messages.add(Message(conversation_id=conv.id, role="assistant", content=final_response or ""))
 
+        
+        self._touch(conv)
         self.db.commit()
 
         return ChatResponse(
