@@ -155,6 +155,7 @@ def build_flight_tools(user_id: str, conversation_id: str | None = None) -> list
             return f"Booked {flight_id} for {passenger_name}, confirmation {booking.booking_ref}.", data
         except Exception:
             logger.exception("book_flight: failed to persist booking for user %s", user_id)
+            db.rollback()  # leave no half-written row / aborted transaction behind
             flight["seats_available"] += 1
             return "Sorry, something went wrong saving the booking. Please try again.", {"status": "error"}
         finally:
